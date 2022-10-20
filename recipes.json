@@ -1,0 +1,6 @@
+{
+  "example-basic": {
+    "cmd": "cargo run --example basic",
+    "kind": "term"
+  }
+}
