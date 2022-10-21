@@ -1,18 +1,19 @@
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak};
 
 use async_trait::async_trait;
-use flax::{buffer::ComponentBuffer, Component, ComponentValue, Entity};
-use futures::future::BoxFuture;
+use flax::{buffer::ComponentBuffer, Component, ComponentValue, Entity, World};
+use futures::{future::BoxFuture, Future};
 
-use crate::state::{Event, SharedEffect, State, StateRef};
+use crate::{
+    components::{attached, fragment},
+    state::{EffectHandle, State, StateRef},
+};
 
 /// State containing the state for an element "fragment" of the UI state.
 pub struct FragmentData {
     id: Entity,
     components: ComponentBuffer,
-
-    sync_effect: SharedEffect,
-    state: StateRef,
+    effect: EffectHandle,
 }
 
 impl FragmentData {
@@ -21,49 +22,77 @@ impl FragmentData {
         self.components.set(component, value);
         self
     }
-
     pub(crate) fn flush(&self) {
-        self.state
-            .tx
-            .send(Event::RunSharedEffect(self.sync_effect.clone()))
-            .ok();
+        self.effect.schedule()
     }
 }
 
-/// Cheaply cloneable reference to a fragment in the tree.
+/// Holds the state for a fragment in the tree.
 ///
 /// Allows for sync and async modification.
+#[derive(Clone)]
 pub struct FragmentState {
     data: Arc<RwLock<FragmentData>>,
+    state: StateRef,
+    id: Entity,
 }
 
 impl FragmentState {
-    pub(crate) fn new(id: Entity, state: StateRef) -> Self {
-        // Make the syncing effect hold a weak reference to the data
+    pub(crate) fn spawn(state: &mut State, parent: Option<Entity>) -> Self {
+        let mut components = ComponentBuffer::new();
+        components.set(fragment(), ());
+        if let Some(parent) = parent {
+            components.set(attached(), parent);
+        }
+
+        let id = state.world_mut().spawn_with(&mut components);
+        assert_eq!(components.components().count(), 0);
+
         let data = Arc::new_cyclic(|weak: &Weak<RwLock<FragmentData>>| {
             let weak = weak.clone();
-            let sync_effect = Arc::new(move |state: &mut State| {
+            let effect = Box::new(move |world: &mut World| {
                 if let Some(data) = weak.upgrade() {
                     let mut data = data.write().unwrap();
-                    let world = state.world_mut();
                     eprintln!("Components: {:?}", data.components);
-                    world.set_with(id, &mut data.components).unwrap()
-                } else {
-                    eprintln!("Data dropped")
+                    world.set_with(id, &mut data.components).unwrap();
                 }
             });
 
-            let data = FragmentData {
+            let effect = state.create_effect(effect);
+            RwLock::new(FragmentData {
                 id,
-                components: ComponentBuffer::new(),
-                state,
-                sync_effect,
-            };
-
-            RwLock::new(data)
+                components,
+                effect,
+            })
         });
 
-        Self { data }
+        FragmentState {
+            data,
+            id,
+            state: state.handle(),
+        }
+    }
+
+    pub(crate) async fn new(state: StateRef, parent: Option<Entity>) -> Self {
+        state
+            .schedule_async(move |state| Self::spawn(state, parent))
+            .await
+    }
+
+    /// Attaches a new child fragment under the current fragment.
+    ///
+    /// The returned value must be polled to advance the fragment.
+    pub fn attach(&self, frag: impl Fragment) -> FragmentFuture {
+        let state = self.state.clone();
+        let parent = self.id;
+        let s = state.clone();
+
+        let future = Box::pin(async move {
+            let state = Self::new(s, Some(parent)).await;
+            frag.render(state).await
+        });
+
+        FragmentFuture { state, future }
     }
 
     /// Access the contents of the fragment
@@ -120,8 +149,36 @@ impl<'a> std::ops::DerefMut for FragmentWriteGuard<'a> {
     }
 }
 
+/// Represents a component of the UI tree
 #[async_trait]
 pub trait Fragment: Send + Sync + 'static {
     /// Renders the component into an entity
     async fn render(self, state: FragmentState);
+}
+
+/// A handle to the spawned fragment.
+///
+/// Polling this advances the fragment.
+///
+/// Dropping the future causes the fragment subtree to be despawned.
+pub struct FragmentFuture {
+    state: StateRef,
+    future: BoxFuture<'static, ()>,
+}
+
+impl FragmentFuture {
+    pub(crate) fn new(state: StateRef, future: BoxFuture<'static, ()>) -> Self {
+        Self { state, future }
+    }
+}
+
+impl Future for FragmentFuture {
+    type Output = ();
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        self.future.as_mut().poll(cx)
+    }
 }
