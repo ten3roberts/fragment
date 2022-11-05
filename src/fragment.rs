@@ -1,151 +1,75 @@
-use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak};
+use std::sync::{Arc, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak};
 
 use async_trait::async_trait;
-use flax::{buffer::ComponentBuffer, Component, ComponentValue, Entity, World};
-use futures::{future::BoxFuture, Future};
+use flax::{
+    buffer::ComponentBuffer, Component, ComponentValue, Entity, EntityBuilder, EntityRefMut, World,
+};
+use futures::{future::BoxFuture, Future, FutureExt};
 
 use crate::{
     components::{attached, fragment},
-    state::{EffectHandle, State, StateRef},
+    state::{AppRef, Event},
 };
 
-/// State containing the state for an element "fragment" of the UI state.
-pub struct FragmentData {
-    id: Entity,
-    components: ComponentBuffer,
-    effect: EffectHandle,
-}
-
-impl FragmentData {
-    /// Sets the component value
-    pub fn set<T: ComponentValue>(&mut self, component: Component<T>, value: T) -> &mut Self {
-        self.components.set(component, value);
-        self
-    }
-    pub(crate) fn flush(&self) {
-        self.effect.schedule()
-    }
-}
-
 /// Holds the state for a fragment in the tree.
-///
-/// Allows for sync and async modification.
-#[derive(Clone)]
 pub struct FragmentState {
-    data: Arc<RwLock<FragmentData>>,
-    state: StateRef,
     id: Entity,
+    state: AppRef,
+    buffer: ComponentBuffer,
 }
 
 impl FragmentState {
-    pub(crate) fn spawn(state: &mut State, parent: Option<Entity>) -> Self {
-        let mut components = ComponentBuffer::new();
-        components.set(fragment(), ());
+    pub(crate) fn spawn(world: &mut World, state: AppRef, parent: Option<Entity>) -> Self {
+        let mut buffer = ComponentBuffer::new();
+        buffer.set(fragment(), ());
+
         if let Some(parent) = parent {
-            components.set(attached(), parent);
+            buffer.set(attached(), parent);
         }
 
-        let id = state.world_mut().spawn_with(&mut components);
-        assert_eq!(components.components().count(), 0);
+        let id = world.spawn_with(&mut buffer);
 
-        let data = Arc::new_cyclic(|weak: &Weak<RwLock<FragmentData>>| {
-            let weak = weak.clone();
-            let effect = Box::new(move |world: &mut World| {
-                if let Some(data) = weak.upgrade() {
-                    let mut data = data.write().unwrap();
-                    eprintln!("Components: {:?}", data.components);
-                    world.set_with(id, &mut data.components).unwrap();
-                }
-            });
+        FragmentState { id, state, buffer }
+    }
 
-            let effect = state.create_effect(effect);
-            RwLock::new(FragmentData {
-                id,
-                components,
-                effect,
-            })
-        });
-
-        FragmentState {
-            data,
-            id,
-            state: state.handle(),
+    /// Access and modify the contents of the fragment.
+    ///
+    /// Blocks until the world is available.
+    pub fn lock(&self) -> FragmentGuard {
+        FragmentGuard {
+            world: self.state.world(),
+            fragment: self,
         }
     }
 
-    pub(crate) async fn new(state: StateRef, parent: Option<Entity>) -> Self {
-        state
-            .schedule_async(move |state| Self::spawn(state, parent))
-            .await
+    pub fn app(&self) -> &AppRef {
+        &self.state
+    }
+}
+
+pub struct FragmentGuard<'a> {
+    world: MutexGuard<'a, World>,
+    fragment: &'a FragmentState,
+}
+
+impl<'a> FragmentGuard<'a> {
+    /// Set a component for the entity
+    pub fn set<T: ComponentValue>(&mut self, component: Component<T>, value: T) -> &mut Self {
+        self.world.set(self.fragment.id, component, value).unwrap();
+        self
     }
 
     /// Attaches a new child fragment under the current fragment.
     ///
     /// The returned value must be polled to advance the fragment.
-    pub fn attach(&self, frag: impl Fragment) -> FragmentFuture {
-        let state = self.state.clone();
-        let parent = self.id;
-        let s = state.clone();
+    pub fn attach(&mut self, frag: impl Fragment) -> FragmentFuture {
+        let state = self.fragment.state.clone();
+        let parent = self.fragment.id;
+        let state = FragmentState::spawn(&mut self.world, state, Some(parent));
 
-        let future = Box::pin(async move {
-            let state = Self::new(s, Some(parent)).await;
-            frag.render(state).await
-        });
+        let future = Box::pin(async move { frag.render(state).await });
 
-        FragmentFuture { state, future }
-    }
-
-    /// Access the contents of the fragment
-    pub fn read(&self) -> FragmentReadGuard {
-        FragmentReadGuard {
-            inner: self.data.read().unwrap(),
-        }
-    }
-
-    /// Access and modify the contents of the fragment.
-    ///
-    /// Blocks until a write guard is available.
-    pub fn write(&self) -> FragmentWriteGuard {
-        FragmentWriteGuard {
-            inner: self.data.write().unwrap(),
-        }
-    }
-}
-
-pub struct FragmentReadGuard<'a> {
-    inner: RwLockReadGuard<'a, FragmentData>,
-}
-
-impl<'a> std::ops::Deref for FragmentReadGuard<'a> {
-    type Target = FragmentData;
-
-    fn deref(&self) -> &Self::Target {
-        &self.inner
-    }
-}
-
-pub struct FragmentWriteGuard<'a> {
-    inner: RwLockWriteGuard<'a, FragmentData>,
-}
-
-impl<'a> Drop for FragmentWriteGuard<'a> {
-    fn drop(&mut self) {
-        // Make sure to sync the inner values
-        self.inner.flush()
-    }
-}
-
-impl<'a> std::ops::Deref for FragmentWriteGuard<'a> {
-    type Target = FragmentData;
-
-    fn deref(&self) -> &Self::Target {
-        &self.inner
-    }
-}
-
-impl<'a> std::ops::DerefMut for FragmentWriteGuard<'a> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.inner
+        FragmentFuture { future }
     }
 }
 
@@ -161,14 +85,20 @@ pub trait Fragment: Send + Sync + 'static {
 /// Polling this advances the fragment.
 ///
 /// Dropping the future causes the fragment subtree to be despawned.
+#[must_use]
 pub struct FragmentFuture {
-    state: StateRef,
-    future: BoxFuture<'static, ()>,
+    pub(crate) future: BoxFuture<'static, ()>,
+}
+
+impl Drop for FragmentState {
+    fn drop(&mut self) {
+        self.state.enqueue(Event::Despawn(self.id)).ok();
+    }
 }
 
 impl FragmentFuture {
-    pub(crate) fn new(state: StateRef, future: BoxFuture<'static, ()>) -> Self {
-        Self { state, future }
+    pub(crate) fn new(state: AppRef, future: BoxFuture<'static, ()>) -> Self {
+        Self { future }
     }
 }
 
@@ -179,6 +109,6 @@ impl Future for FragmentFuture {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
-        self.future.as_mut().poll(cx)
+        self.future.poll_unpin(cx)
     }
 }
