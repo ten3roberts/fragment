@@ -13,10 +13,10 @@ use crossterm::{
 };
 use flax::{component, events::ChangeSubscriber, name, Query};
 use fragment::{
-    fragment::{Fragment, FragmentState},
-    state::{App, Event},
+    app::{App, Event},
+    Fragment, Widget,
 };
-use futures::{join, StreamExt};
+use futures::StreamExt;
 use glam::{vec2, Vec2};
 use tokio::sync::Notify;
 
@@ -32,10 +32,11 @@ component! {
 pub struct Text(String);
 
 #[async_trait]
-impl Fragment for Text {
-    async fn render(self, state: FragmentState) {
-        state
-            .lock()
+impl Widget for Text {
+    type Output = ();
+    async fn render(self, fragment: &mut Fragment) {
+        fragment
+            .write()
             .set(content(), self.0)
             .set(pos(), vec2(0.0, 0.0))
             .set(widget(), ());
@@ -45,27 +46,26 @@ impl Fragment for Text {
 pub struct Application {}
 
 #[async_trait]
-impl Fragment for Application {
-    async fn render(self, state: fragment::fragment::FragmentState) {
-        eprintln!("Drawing application");
-
-        state
-            .lock()
+impl Widget for Application {
+    type Output = ();
+    async fn render(self, fragment: &mut Fragment) {
+        fragment
+            .write()
             .set(name(), "Application".into())
             .set(content(), "Hello, World!".into())
             .set(pos(), vec2(0.0, 0.0))
             .set(widget(), ());
 
+        tokio::spawn(fragment.attach(Renderer));
+        tokio::spawn(fragment.attach(EventHandler));
+
         tokio::time::sleep(Duration::from_millis(1000)).await;
 
-        let clock = state.lock().attach(Clock {
+        let clock = fragment.attach(Clock {
             interval: Duration::from_millis(500),
         });
 
-        let renderer = state.lock().attach(Renderer);
-        let events = state.lock().attach(EventHandler);
-
-        join!(renderer, events, clock);
+        clock.await
     }
 }
 
@@ -74,18 +74,14 @@ struct Clock {
 }
 
 #[async_trait]
-impl Fragment for Clock {
-    async fn render(self, state: FragmentState) {
+impl Widget for Clock {
+    type Output = ();
+    async fn render(self, frag: &mut Fragment) {
         let start = Instant::now();
-
-        state.lock().set(pos(), vec2(0.0, 5.0)).set(widget(), ());
 
         loop {
             let elapsed = start.elapsed();
-            println!("Setting content");
-            state
-                .lock()
-                .set(content(), format!("Elapsed: {:?}", elapsed));
+            frag.put(Text(format!("Elapsed: {:?}", elapsed))).await;
 
             tokio::time::sleep(self.interval).await
         }
@@ -94,16 +90,17 @@ impl Fragment for Clock {
 
 struct EventHandler;
 #[async_trait]
-impl Fragment for EventHandler {
-    async fn render(self, state: FragmentState) {
+impl Widget for EventHandler {
+    type Output = eyre::Result<()>;
+    async fn render(self, state: &mut Fragment) -> eyre::Result<()> {
         let mut events = crossterm::event::EventStream::new();
 
-        state.lock().set(pos(), vec2(10.0, 10.0)).set(widget(), ());
+        state.write().set(pos(), vec2(10.0, 10.0)).set(widget(), ());
 
-        let app = state.app();
+        let app = state.app().clone();
 
         while let Some(Ok(event)) = events.next().await {
-            state.lock().set(content(), format!("{event:?}"));
+            state.write().set(content(), format!("{event:?}"));
             match event {
                 crossterm::event::Event::Key(KeyEvent {
                     code: KeyCode::Char('q'),
@@ -114,19 +111,21 @@ impl Fragment for EventHandler {
                     modifiers: KeyModifiers::CONTROL,
                     ..
                 }) => {
-                    app.enqueue(Event::Exit).unwrap();
+                    app.enqueue(Event::Exit)?;
                 }
                 _ => {}
             }
         }
+        Ok(())
     }
 }
 
 struct Renderer;
 
 #[async_trait]
-impl Fragment for Renderer {
-    async fn render(self, state: FragmentState) {
+impl Widget for Renderer {
+    type Output = eyre::Result<()>;
+    async fn render(self, state: &mut Fragment) -> eyre::Result<()> {
         let mut stdout = stdout();
 
         let ui_changed = Arc::new(Notify::new());
@@ -163,7 +162,6 @@ impl Fragment for Renderer {
 
 impl Drop for Renderer {
     fn drop(&mut self) {
-        println!("Dropping renderer");
         disable_raw_mode().unwrap()
     }
 }

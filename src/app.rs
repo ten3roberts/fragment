@@ -9,7 +9,7 @@ use flume::{Receiver, Sender};
 use futures::{future::select, try_join, FutureExt};
 use slotmap::new_key_type;
 
-use crate::fragment::{Fragment, FragmentFuture, FragmentState};
+use crate::{Fragment, Widget};
 
 new_key_type! {
     struct EffectKey;
@@ -35,8 +35,8 @@ impl App {
         }
     }
 
-    /// Runs the app with the provided root fragment
-    pub async fn run(self, root: impl Fragment) -> eyre::Result<()> {
+    /// Runs the app with the provided root
+    pub async fn run(self, root: impl Widget) -> eyre::Result<()> {
         let rx = self.rx;
 
         let handle = AppRef {
@@ -64,21 +64,18 @@ impl App {
         };
 
         let handle_tree = async move {
-            let state = FragmentState::spawn(&mut world.lock().unwrap(), handle, None);
-            root.render(state).await;
+            let mut state = Fragment::spawn(handle.clone(), None);
+            root.render(&mut state).await;
             Ok::<_, eyre::Report>(())
         };
 
         tokio::select! {
             _ = handle_events => {
-                println!("Finished event loop");
             }
             _ = handle_tree => {
 
             }
         }
-
-        println!("Exiting app");
 
         Ok::<_, eyre::Report>(())
     }
@@ -91,19 +88,7 @@ impl Default for App {
 }
 
 impl AppRef {
-    /// Spawns a new *root* fragment
-    ///
-    /// The futures runs until the fragment ends, which may be forever since fragments can enter a
-    /// yield-update loop.
-    pub fn spawn_fragment(&mut self, frag: impl Fragment) -> FragmentFuture {
-        let mut world = self.world();
-        let id = world.spawn();
-        let state = FragmentState::spawn(&mut world, self.clone(), None);
-        FragmentFuture {
-            future: frag.render(state),
-        }
-    }
-
+    /// Lock the world
     pub fn world(&self) -> MutexGuard<World> {
         self.world.lock().unwrap()
     }

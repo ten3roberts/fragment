@@ -1,6 +1,6 @@
 use flax::{component, Entity};
 
 component! {
-    pub fragment: (),
+    pub widget: (),
     pub attached: Entity,
 }
