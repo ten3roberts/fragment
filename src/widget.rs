@@ -1,9 +1,11 @@
-use std::sync::{Mutex, MutexGuard};
+use std::sync::MutexGuard;
 
 use async_trait::async_trait;
 use flax::{child_of, Component, ComponentValue, Entity, World};
-use futures::Future;
-use slotmap::secondary::Entry;
+use futures::{
+    future::{BoxFuture, LocalBoxFuture},
+    Future, FutureExt,
+};
 
 use crate::{app::AppRef, components::widget};
 
@@ -11,9 +13,12 @@ use crate::{app::AppRef, components::widget};
 /// Represents a widget which can be rendered into a fragment of the UI tree.
 ///
 /// Widgets can optionally return a value, which can be used for Input fields or alike.
-pub trait Widget {
+pub trait Widget: Send {
     type Output;
     async fn render(self, fragment: &mut Fragment) -> Self::Output;
+    async fn render_boxed(self: Box<Self>, fragment: &mut Fragment) -> Self::Output {
+        self.render(fragment).await
+    }
 }
 
 pub struct Fragment {
@@ -22,7 +27,7 @@ pub struct Fragment {
 }
 
 impl Fragment {
-    pub(crate) fn spawn(app: AppRef, parent: Option<Entity>) -> Fragment {
+    pub(crate) fn spawn(world: &mut World, app: AppRef, parent: Option<Entity>) -> Fragment {
         let mut builder = Entity::builder();
 
         builder.tag(widget());
@@ -30,10 +35,8 @@ impl Fragment {
             builder.tag(child_of(parent));
         }
 
-        let mut world = app.world();
-        let id = builder.spawn(&mut world);
+        let id = builder.spawn(world);
 
-        drop(world);
         Fragment { id, app }
     }
 
@@ -58,16 +61,38 @@ impl Fragment {
     }
 
     /// Attach another fragment as a child
-    pub fn attach<'a, W>(&mut self, widget: W) -> impl Future<Output = W::Output> + 'a
+    pub fn attach<'w, W>(&mut self, widget: W) -> WidgetFuture<'w, W::Output>
     where
-        W: 'a + Widget,
+        W: 'w + Widget,
     {
-        let app = self.app.clone();
-        let id = self.id;
-        async move {
-            let mut child = Fragment::spawn(app, Some(id));
-            widget.render(&mut child).await
-        }
+        let mut guard = self.write();
+        guard.attach(widget)
+    }
+
+    pub fn id(&self) -> Entity {
+        self.id
+    }
+}
+
+pub struct WidgetFuture<'a, T = ()> {
+    fut: BoxFuture<'a, T>,
+    id: Entity,
+}
+
+impl<'a, T> Future for WidgetFuture<'a, T> {
+    type Output = T;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        self.fut.poll_unpin(cx)
+    }
+}
+
+impl<'a, T> WidgetFuture<'a, T> {
+    pub fn id(&self) -> Entity {
+        self.id
     }
 }
 
@@ -100,4 +125,59 @@ impl<'a> FragmentRef<'a> {
 
         self
     }
+
+    /// Attach another fragment as a child
+    pub fn attach<'w, W>(&mut self, widget: W) -> WidgetFuture<'w, W::Output>
+    where
+        W: 'w + Widget,
+    {
+        let app = self.fragment.app.clone();
+        let id = self.fragment.id;
+        let mut child = Fragment::spawn(&mut self.world, app, Some(id));
+
+        WidgetFuture {
+            id: child.id,
+            fut: Box::pin(async move { widget.render(&mut child).await }),
+        }
+    }
 }
+
+#[async_trait]
+impl<W> Widget for Box<W>
+where
+    W: ?Sized + Widget + Send,
+{
+    type Output = W::Output;
+    async fn render(self, frag: &mut Fragment) -> Self::Output {
+        W::render_boxed(self, frag).await
+    }
+}
+
+/// Helper trait for turning a list of widgets into a list of render futures.
+pub trait WidgetCollection {
+    /// Convert the collection into fragments
+    fn attach(self, parent: &mut Fragment) -> Vec<WidgetFuture<'static>>;
+}
+
+impl WidgetCollection for Vec<Box<dyn Widget<Output = ()> + Send>> {
+    fn attach(self, parent: &mut Fragment) -> Vec<WidgetFuture<'static>> {
+        let mut guard = parent.write();
+        self.into_iter().map(|w| guard.attach(w)).collect()
+    }
+}
+
+macro_rules! tuple_impl {
+    ($($idx: tt => $ty: ident),*) => {
+        impl<$($ty: Widget<Output = ()> + 'static + Send,)*> WidgetCollection for ($($ty,)*) {
+            fn attach(self, parent: &mut Fragment) -> Vec<WidgetFuture<'static>> {
+                let mut guard = parent.write();
+                vec![$( guard.attach(self.$idx),)*]
+            }
+        }
+    };
+}
+
+tuple_impl! { 0 => A }
+tuple_impl! { 0 => A, 1 => B }
+tuple_impl! { 0 => A, 1 => B, 2 => C }
+tuple_impl! { 0 => A, 1 => B, 2 => C, 3 => D }

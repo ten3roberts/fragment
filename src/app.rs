@@ -64,7 +64,7 @@ impl App {
         };
 
         let handle_tree = async move {
-            let mut state = Fragment::spawn(handle.clone(), None);
+            let mut state = Fragment::spawn(&mut world.lock().unwrap(), handle.clone(), None);
             root.render(&mut state).await;
             Ok::<_, eyre::Report>(())
         };

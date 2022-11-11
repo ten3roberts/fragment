@@ -8,25 +8,88 @@ use async_trait::async_trait;
 use crossterm::{
     cursor,
     event::{KeyCode, KeyEvent, KeyModifiers},
+    queue,
     terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType},
     QueueableCommand,
 };
-use flax::{component, events::ChangeSubscriber, name, Query};
+use flax::{
+    child_of, component,
+    events::{ChangeSubscriber, SubscriberFilterExt},
+    name, Query,
+};
 use fragment::{
     app::{App, Event},
-    Fragment, Widget,
+    Fragment, Widget, WidgetCollection,
 };
-use futures::StreamExt;
+use futures::{join, stream::FuturesUnordered, StreamExt};
 use glam::{vec2, Vec2};
+use itertools::Itertools;
 use tokio::sync::Notify;
 
 slotmap::new_key_type! { pub struct WidgetKey; }
 
 component! {
     widget: (),
-    pos: Vec2,
+    position: Vec2,
+    size: Vec2,
     content: String,
 
+}
+
+pub struct Row<W: WidgetCollection> {
+    widgets: W,
+    padding: f32,
+}
+
+impl<W: WidgetCollection> Row<W> {
+    pub fn new(widgets: W) -> Self {
+        Self {
+            widgets,
+            padding: 2.0,
+        }
+    }
+}
+
+#[async_trait]
+impl<W: WidgetCollection + Send> Widget for Row<W> {
+    type Output = ();
+    async fn render(self, frag: &mut Fragment) {
+        let futures = self.widgets.attach(frag);
+
+        let ids = futures.iter().map(|v| v.id()).collect_vec();
+        let mut futures = futures.into_iter().collect::<FuturesUnordered<_>>();
+
+        let width_changed = Arc::new(Notify::new());
+
+        let app = frag.app().clone();
+        {
+            app.world().subscribe(
+                ChangeSubscriber::new(&[size().key()], Arc::downgrade(&width_changed)), // .filter(child_of(frag.id()).with()),
+            )
+        }
+
+        let update_layout = async {
+            let mut query = Query::new((size(), position().as_mut()));
+            loop {
+                width_changed.notified().await;
+                println!("Updating layout for {ids:?}");
+                {
+                    let guard = frag.app().world();
+                    let mut q = query.borrow(&guard);
+                    let mut cursor = Vec2::ZERO;
+                    for &id in &ids {
+                        let (size, pos) = q.get(id).unwrap();
+                        *pos = cursor;
+                        cursor += *size * Vec2::X + self.padding * Vec2::X;
+                    }
+                }
+            }
+        };
+
+        let update_loop = async { while let Some(()) = futures.next().await {} };
+
+        join!(update_loop, update_layout);
+    }
 }
 
 pub struct Text(String);
@@ -37,8 +100,9 @@ impl Widget for Text {
     async fn render(self, fragment: &mut Fragment) {
         fragment
             .write()
+            .set(size(), vec2(self.0.len() as f32, 1.0))
             .set(content(), self.0)
-            .set(pos(), vec2(0.0, 0.0))
+            .set(position(), vec2(0.0, 0.0))
             .set(widget(), ());
     }
 }
@@ -53,7 +117,7 @@ impl Widget for Application {
             .write()
             .set(name(), "Application".into())
             .set(content(), "Hello, World!".into())
-            .set(pos(), vec2(0.0, 0.0))
+            .set(position(), vec2(0.0, 0.0))
             .set(widget(), ());
 
         tokio::spawn(fragment.attach(Renderer));
@@ -61,11 +125,15 @@ impl Widget for Application {
 
         tokio::time::sleep(Duration::from_millis(1000)).await;
 
-        let clock = fragment.attach(Clock {
+        let clock = Clock {
             interval: Duration::from_millis(500),
-        });
+        };
 
-        clock.await
+        let clock2 = Clock {
+            interval: Duration::from_millis(1000),
+        };
+
+        fragment.put(Row::new((clock, clock2))).await
     }
 }
 
@@ -95,7 +163,10 @@ impl Widget for EventHandler {
     async fn render(self, state: &mut Fragment) -> eyre::Result<()> {
         let mut events = crossterm::event::EventStream::new();
 
-        state.write().set(pos(), vec2(10.0, 10.0)).set(widget(), ());
+        state
+            .write()
+            .set(position(), vec2(10.0, 10.0))
+            .set(widget(), ());
 
         let app = state.app().clone();
 
@@ -130,11 +201,11 @@ impl Widget for Renderer {
 
         let ui_changed = Arc::new(Notify::new());
         state.app().world().subscribe(ChangeSubscriber::new(
-            &[pos().key(), content().key()],
+            &[position().key(), content().key()],
             Arc::downgrade(&ui_changed),
         ));
 
-        let mut draw_query = Query::new((pos(), content())).with(widget());
+        let mut draw_query = Query::new((position(), content())).with(widget());
 
         enable_raw_mode().unwrap();
 
