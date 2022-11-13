@@ -1,26 +1,36 @@
 use std::sync::MutexGuard;
 
-use async_trait::async_trait;
 use flax::{child_of, Component, ComponentValue, Entity, World};
-use futures::{
-    future::{BoxFuture, LocalBoxFuture},
-    Future, FutureExt,
-};
+use futures::{future::BoxFuture, Future, FutureExt};
 
 use crate::{app::AppRef, components::widget};
 
-#[async_trait]
 /// Represents a widget which can be rendered into a fragment of the UI tree.
 ///
 /// Widgets can optionally return a value, which can be used for Input fields or alike.
 pub trait Widget: Send {
     type Output;
-    async fn render(self, fragment: &mut Fragment) -> Self::Output;
-    async fn render_boxed(self: Box<Self>, fragment: &mut Fragment) -> Self::Output {
-        self.render(fragment).await
+    /// Mounts the widget, returning a future which updates and keeps track of the state.
+    fn mount(self, fragment: Fragment) -> BoxFuture<'static, Self::Output>;
+}
+
+trait BoxedWidget: Send {
+    type Output;
+    fn mount_boxed(self: Box<Self>, fragment: Fragment) -> BoxFuture<'static, Self::Output>;
+}
+
+impl<W> BoxedWidget for W
+where
+    W: ?Sized + Widget,
+{
+    type Output = W::Output;
+
+    fn mount_boxed(self: Box<Self>, fragment: Fragment) -> BoxFuture<'static, W::Output> {
+        (self).mount(fragment)
     }
 }
 
+/// Represents a piece of the UI
 pub struct Fragment {
     id: Entity,
     app: AppRef,
@@ -47,15 +57,20 @@ impl Fragment {
             fragment: self,
         }
     }
+
     /// Render a widget in this fragment.
     ///
     /// This is used to yield a whole widget to the fragment
     pub async fn put<W: Widget>(&mut self, widget: W) -> W::Output {
-        self.write().clear();
-        widget.render(self).await
+        widget
+            .mount(Self {
+                id: self.id,
+                app: self.app().clone(),
+            })
+            .await
     }
 
-    /// Returns a handle used to control the app
+    // Returns a handle used to control the app
     pub fn app(&self) -> &AppRef {
         &self.app
     }
@@ -65,8 +80,14 @@ impl Fragment {
     where
         W: 'w + Widget,
     {
-        let mut guard = self.write();
-        guard.attach(widget)
+        let app = self.app.clone();
+        let id = self.id;
+        let child = Fragment::spawn(&mut self.app.world(), app, Some(id));
+
+        WidgetFuture {
+            id: child.id,
+            fut: widget.mount(child),
+        }
     }
 
     pub fn id(&self) -> Entity {
@@ -117,7 +138,7 @@ impl<'a> FragmentRef<'a> {
     }
 
     fn clear(&mut self) -> &mut Self {
-        self.world.despawn_children(self.fragment.id, child_of);
+        self.world.despawn_children(self.fragment.id, child_of).ok();
         self.world
             .entity_mut(self.fragment.id)
             .unwrap()
@@ -125,31 +146,16 @@ impl<'a> FragmentRef<'a> {
 
         self
     }
-
-    /// Attach another fragment as a child
-    pub fn attach<'w, W>(&mut self, widget: W) -> WidgetFuture<'w, W::Output>
-    where
-        W: 'w + Widget,
-    {
-        let app = self.fragment.app.clone();
-        let id = self.fragment.id;
-        let mut child = Fragment::spawn(&mut self.world, app, Some(id));
-
-        WidgetFuture {
-            id: child.id,
-            fut: Box::pin(async move { widget.render(&mut child).await }),
-        }
-    }
 }
 
-#[async_trait]
 impl<W> Widget for Box<W>
 where
-    W: ?Sized + Widget + Send,
+    W: ?Sized + Widget,
 {
     type Output = W::Output;
-    async fn render(self, frag: &mut Fragment) -> Self::Output {
-        W::render_boxed(self, frag).await
+
+    fn mount(self, frag: Fragment) -> BoxFuture<'static, Self::Output> {
+        self.mount_boxed(frag)
     }
 }
 
@@ -161,8 +167,7 @@ pub trait WidgetCollection {
 
 impl WidgetCollection for Vec<Box<dyn Widget<Output = ()> + Send>> {
     fn attach(self, parent: &mut Fragment) -> Vec<WidgetFuture<'static>> {
-        let mut guard = parent.write();
-        self.into_iter().map(|w| guard.attach(w)).collect()
+        self.into_iter().map(|w| parent.attach(w)).collect()
     }
 }
 
@@ -170,8 +175,7 @@ macro_rules! tuple_impl {
     ($($idx: tt => $ty: ident),*) => {
         impl<$($ty: Widget<Output = ()> + 'static + Send,)*> WidgetCollection for ($($ty,)*) {
             fn attach(self, parent: &mut Fragment) -> Vec<WidgetFuture<'static>> {
-                let mut guard = parent.write();
-                vec![$( guard.attach(self.$idx),)*]
+                vec![$( parent.attach(self.$idx),)*]
             }
         }
     };

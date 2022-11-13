@@ -7,7 +7,6 @@ edition = "2021"
 
 [dependencies]
 parking_lot = "0.12"
-async-trait = "0.1.58"
 eyre = "0.6.8"
 flax = { version = "0.3.2", features = ["tokio"] }
 flume = "0.10.14"

@@ -1,6 +1,8 @@
-use flax::{component, Entity};
+use flax::component;
+use glam::Vec2;
 
 component! {
     pub widget: (),
-    pub attached: Entity,
+    pub size: Vec2,
+    pub position:Vec2,
 }

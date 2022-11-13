@@ -6,7 +6,6 @@ use std::{
 use flax::{Entity, World};
 use flume::{Receiver, Sender};
 
-use futures::{future::select, try_join, FutureExt};
 use slotmap::new_key_type;
 
 use crate::{Fragment, Widget};
@@ -14,8 +13,6 @@ use crate::{Fragment, Widget};
 new_key_type! {
     struct EffectKey;
 }
-
-pub(crate) type Effect = Box<dyn FnMut(&mut World) + Send>;
 
 /// The UI state of the world
 #[derive(Debug)]
@@ -64,8 +61,8 @@ impl App {
         };
 
         let handle_tree = async move {
-            let mut state = Fragment::spawn(&mut world.lock().unwrap(), handle.clone(), None);
-            root.render(&mut state).await;
+            let state = Fragment::spawn(&mut world.lock().unwrap(), handle.clone(), None);
+            root.mount(state).await;
             Ok::<_, eyre::Report>(())
         };
 
