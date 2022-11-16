@@ -32,8 +32,8 @@ impl App {
         }
     }
 
-    /// Runs the app with the provided root
-    pub async fn run(self, root: impl Widget) -> eyre::Result<()> {
+    /// Runs the app until the root exits
+    pub async fn run<W: Widget>(self, root: W) -> W::Output {
         let rx = self.rx;
 
         let handle = AppRef {
@@ -41,40 +41,29 @@ impl App {
             tx: self.tx,
         };
 
-        let world = &self.world;
-
-        let handle_events = async move {
-            while let Ok(event) = rx.recv_async().await {
-                let mut world = world.lock().unwrap();
-                for event in once(event).chain(rx.drain()) {
-                    println!("Handling event: {event:?}");
-                    match event {
-                        Event::Exit => return Ok(()),
-                        Event::Despawn(id) => {
-                            world.despawn(id)?;
+        {
+            let world = self.world.clone();
+            let handle_events = async move {
+                while let Ok(event) = rx.recv_async().await {
+                    let mut world = world.lock().unwrap();
+                    for event in once(event).chain(rx.drain()) {
+                        println!("Handling event: {event:?}");
+                        match event {
+                            Event::Exit => return Ok(()),
+                            Event::Despawn(id) => {
+                                world.despawn(id)?;
+                            }
                         }
                     }
                 }
-            }
 
-            Ok::<_, eyre::Report>(())
-        };
-
-        let handle_tree = async move {
-            let state = Fragment::spawn(&mut world.lock().unwrap(), handle.clone(), None);
-            root.mount(state).await;
-            Ok::<_, eyre::Report>(())
-        };
-
-        tokio::select! {
-            _ = handle_events => {
-            }
-            _ = handle_tree => {
-
-            }
+                Ok::<_, eyre::Report>(())
+            };
+            tokio::spawn(handle_events);
         }
 
-        Ok::<_, eyre::Report>(())
+        let state = Fragment::spawn(&mut self.world.lock().unwrap(), handle.clone(), None);
+        root.mount(state).await
     }
 }
 
